@@ -35,7 +35,7 @@ github.com = "<token>"
 
 ```
 (ns-sources
-  "jhlog" {:url ".../jhlog"}})
+  "jhlog" {:url "https://raw.githubusercontent.com/candid82/jhlog/v1.0.0/jhlog.joke"}})
 
 (ns foo
   (:require [jhlog]))

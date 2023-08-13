@@ -1,0 +1,244 @@
+#!/usr/bin/env joker
+
+(ns jhlog
+  (:require [joker.filepath]
+            [joker.git :as git]
+            [joker.os :as os]
+            [joker.string :as string]
+            [joker.time :as time]))
+
+(def *github-token* "")
+(def *github-api-url* "")
+
+(defn- fatal-error
+  [msg & args]
+  (println-err (apply format msg args))
+  (os/exit 1))
+
+(defn- extract-origin-info-from-url
+  [origin-url]
+  (when-let [[_ repo-host user repo] (or
+                                      ;; https:// URI, typically inside Looper
+                                      ;; Note that the .git extension is optional
+                                      (re-matches #"https://(.+?)/(.+?)/(.+?)\.git" origin-url)
+                                      (re-matches #"https://(.+?)/(.+?)/(.+?)" origin-url)
+                                      ;; Git/ssh URL, typically as seen by a developer locally
+                                      (re-matches #"git@(.+?):(.+?)/(.+?)\.git" origin-url)
+                                      (re-matches #"git@(.+?):(.+?)/(.+?)" origin-url))]
+    {:repo-host repo-host
+     :username user
+     :repo-name repo}))
+
+(defn- get-github-api-url
+  [origin-info]
+  (let [{:keys [repo-host]} origin-info
+        github-url (str "https://" repo-host)]
+    (if (= "https://github.com" github-url)
+      (str "https://api.github.com/graphql")
+      (str github-url "/api/graphql"))))
+
+(defn- get-commit-url
+  [origin-info sha]
+  (str "https://" (:repo-host origin-info) "/" (:username origin-info) "/" (:repo-name origin-info) "/commit/" sha))
+
+(def ^:private pulls-query
+  "query {
+  repository(owner: \"%s\", name: \"%s\") {
+    pullRequests(states:MERGED, baseRefName: \"%s\", first: %d, orderBy: {field: UPDATED_AT, direction: DESC}, after: %s) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        number
+        title
+        url
+        mergedAt
+        author {
+          login
+          url
+        }
+        mergeCommit {
+          oid
+        }
+        commits(first: 250) {
+          nodes {
+            commit {
+              oid
+            }
+          }
+        }
+      }
+    }
+  }
+}
+")
+
+(defn- call-github
+  [graphql-query]
+  (let [req {:url *github-api-url*
+             :method :post
+             :body (joker.json/write-string {:query graphql-query})
+             :headers {"Authorization" (str "token " *github-token*)}}
+        {:keys [status body]} (joker.http/send req)]
+    (cond
+      (= 200 status) (joker.json/read-string body {:keywords? true})
+      :else (fatal-error "Error calling githup API: %s" body))))
+
+(defn- retrieve-pulls
+  [origin-info branch since cursor]
+  (let [pulls-page 25
+        {:keys [username repo-name]} origin-info
+        res (-> (call-github (format pulls-query username repo-name branch pulls-page
+                                     (if cursor (str "\"" cursor "\"") "null")))
+                :data :repository :pullRequests)
+        page-pulls-since (filterv (fn [pull]
+                                    (let [pull-date (time/parse time/rfc3339 (:mergedAt pull))]
+                                      (pos? (time/sub pull-date since))))
+                                  (:nodes res))]
+    (if (or (< (count page-pulls-since) (* pulls-page 0.8))
+            (not (-> res :pageInfo :hasNextPage)))
+      page-pulls-since
+      (into page-pulls-since (retrieve-pulls origin-info branch since (-> res :pageInfo :endCursor))))))
+
+(defn- get-commits
+  [repo since last-sha]
+  (git/log repo {:from last-sha :since (time/add since 1) :order :committer-time}))
+
+(defn- merge-commit?
+  [commit]
+  (> (count (:parent-hashes commit)) 1))
+
+(defn- get-pulls-and-commits
+  [repo origin-info current-branch first-sha last-sha]
+  (let [first-commit (git/commit repo first-sha)
+        since (:when (:committer first-commit))]
+    (let [pulls-since (retrieve-pulls origin-info current-branch since nil)
+          all-commits (get-commits repo since last-sha)
+          all-shas (->> all-commits
+                        (map :hash)
+                        (set))
+          pulls (filterv #(contains? all-shas (-> % :mergeCommit :oid)) pulls-since)
+          merge-commits (->> pulls
+                             (map #(-> % :mergeCommit :oid))
+                             (set))
+          pull-commits (->> pulls
+                            (mapcat #(-> % :commits :nodes))
+                            (map #(-> % :commit :oid))
+                            (into merge-commits))
+          commits-without-pulls (remove (fn [commit]
+                                          (or (merge-commit? commit)
+                                              (contains? pull-commits (:hash commit))))
+                                        all-commits)]
+      {:commits commits-without-pulls
+       :pulls pulls})))
+
+(defn- pull-text
+  [{:keys [number url title author]}]
+  (format "- [#%d](%s) - %s ([@%s](%s))"
+          number url title (:login author) (:url author)))
+
+(defn- commit-summary
+  [commit-message]
+  (first (string/split commit-message #"\n")))
+
+(defn- shorten-sha
+  [^String sha]
+  (subs sha 0 7))
+
+(defn- commit-text
+  [origin-info {:keys [message hash author]}]
+  (format "- [%s](%s) - %s (%s)"
+          (shorten-sha hash)
+          (get-commit-url origin-info hash)
+          (commit-summary message)
+          (:name author)))
+
+(defn- pulls-and-commits-text
+  [origin-info pulls commits]
+  (string/join
+   "\n"
+   (concat (map pull-text pulls)
+           (map #(commit-text origin-info %) (remove merge-commit? commits)))))
+
+(defn- release-notes-text
+  [changes]
+  (let [{:keys [origin-info pulls commits]} changes]
+    (str (pulls-and-commits-text origin-info pulls commits) "\n")))
+
+(defn- get-github-token
+  [host]
+  (let [config-filename (joker.filepath/join (os/get-env "HOME") ".jhlog")
+        config (try (slurp config-filename)
+                    (catch Error e
+                      (fatal-error "Cannot open config file: %s" config-filename)))]
+    (->> config
+         (string/split-lines)
+         (remove string/blank?)
+         (map #(joker.string/split % #"\s*=\s*"))
+         (filter #(= host (first %)))
+         (first)
+         (second)
+         (re-matches #"\"(.+)\"")
+         (second))))
+
+(defn- print-usage
+  [summary]
+  (println-err "Usage: jhlog [options]")
+  (println-err "Options:")
+  (println-err summary))
+
+(defn change-log
+  [repo-path first-ref last-ref github-token]
+  (let [repo (try (git/open repo-path)
+                  (catch Error err
+                    (throw (ex-info (format "Error openning git repository %s: %s" repo-path (ex-message err)) {}))))
+        origin-url (get-in (git/config repo) [:remotes "origin" :urls 0])
+        origin-info (extract-origin-info-from-url origin-url)
+        github-token (or github-token (get-github-token (:repo-host origin-info)))
+        first-commit-sha (try (git/resolve-revision repo first-ref)
+                              (catch Error e
+                                (throw (ex-info (format "Invalid first commit sha or tag: %s" first-ref) {}))))
+        last-commit-sha (try (git/resolve-revision repo last-ref)
+                             (catch Error e
+                               (throw (ex-info (format "Invalid last commit sha or tag: %s" last-ref) {}))))
+        current-branch (last (string/split (:name (git/head repo)) "/"))
+        _ (when-not (contains? #{"master" "main"} current-branch)
+            (throw (ex-info (format "Current branch (%s) is not master or main." current-branch) {})))]
+    (binding [*github-token* github-token
+              *github-api-url* (get-github-api-url origin-info)]
+      (assoc (get-pulls-and-commits repo origin-info current-branch first-commit-sha last-commit-sha)
+             :origin-info origin-info))))
+
+(defn change-log-notes
+  [repo-path first-ref last-ref github-token]
+  (let [changes (change-log repo-path first-ref last-ref github-token)]
+    (release-notes-text changes)))
+
+(defn- main [args]
+  (let [cli-options [["-p" "--path PATH" "Path to the project repository"]
+                     ["-f" "--first FIRST" "First commit SHA or tag of the log"]
+                     ["-l" "--last LAST" "Last commit SHA or tag of the log" :default "head"]
+                     ["-t" "--github-token GITHUB_TOKEN" "Github token"]
+                     ["-h" "--help"]]
+        {:keys [options errors summary]} (joker.tools.cli/parse-opts args cli-options)
+        _ (when errors
+            (println-err (string/join "\n" errors))
+            (print-usage summary)
+            (os/exit 1))
+        _ (when (:help options)
+            (print-usage summary)
+            (os/exit 0))
+        _ (when-not (:first options)
+            (println-err "--first option is required")
+            (print-usage summary)
+            (os/exit 0))
+        repo-path (or (:path options) (os/cwd))]
+    (try
+      (let [changes (change-log repo-path (:first options) (:last options) (:github-token options))
+            notes (release-notes-text changes)]
+        (println notes))
+      (catch Error err
+        (fatal-error (ex-message err))))))
+
+(when (= *main-file* *file*) (main *command-line-args*))

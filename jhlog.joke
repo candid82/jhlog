@@ -96,7 +96,7 @@
     (if (or (< (count page-pulls-since) (* pulls-page 0.8))
             (not (-> res :pageInfo :hasNextPage)))
       page-pulls-since
-      (into page-pulls-since (retrieve-pulls origin-info branch since (-> res :pageInfo :endCursor))))))
+      (into page-pulls-since (retrieve-pulls ctx origin-info branch since (-> res :pageInfo :endCursor))))))
 
 (defn- get-commits
   [repo since last-sha]
